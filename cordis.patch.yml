@@ -1,0 +1,10 @@
+# dsh-state-graph bundle patch: inserts the StateGraph orchestration engine
+# into any profile that lists this package in `dsh.profile.bundles`.
+- insert:
+    - id: state-graph
+      name: 'dsh-state-graph'
+      config:
+        # 默认防死循环单次执行最大迭代上限
+        defaultMaxIterations: 25
+        # 是否在控制台及日志总线输出路由轨迹
+        logTrajectory: true

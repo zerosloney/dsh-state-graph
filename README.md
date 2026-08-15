@@ -1,0 +1,119 @@
+# dsh-state-graph
+
+把 **StateGraph 有向状态图编排引擎**移植为 **DeepSeek Harness (dsh) 插件**：用声明式的节点 / 静态边 / 条件边把 Harness 单向线性的 ReAct 调度提升为支持多分支条件路由、循环重试、子图嵌套及并发汇聚的图编排运行时。
+
+```text
+addNode / addEdge / addConditionalEdge → 纯函数增量补丁 → 迭代熔断 → 轨迹事件流
+```
+
+## 这是什么
+
+`dsh-state-graph` 是一个 **dsh bundle 包**：导出一个 cordis 插件（`state-graph`），提供 `ctx.graph` 服务。插件的核心是设计文档《状态图（StateGraph）编排引擎技术方案与架构设计》中的有向状态图运行时内核：
+
+| 能力 | 落点 |
+| --- | --- |
+| 声明式拓扑构造（Fluent API：addNode / addEdge / addConditionalEdge） | `StateGraph` |
+| 纯函数增量补丁：节点只返回 `Partial<State>`，引擎不可变合并 | `StateGraph.run` |
+| 防死循环熔断（默认 25 次迭代，超限抛错） | `StateGraph` 内置 |
+| 双向事件流观测（`graph/*` 事件，追加式轨迹） | `ctx.emit` 事件总线 |
+| 隔离的状态图实例工厂 | `ctx.graph.create()` |
+
+## 核心接口
+
+| 接口 / 类型 | 签名 | 说明 |
+| --- | --- | --- |
+| `NodeHandler<T>` | `(state: T, ctx: Context) => Promise<Partial<T>> \| Partial<T>` | 节点业务执行体，返回需合并的状态增量 |
+| `ConditionHandler<T>` | `(state: T, ctx: Context) => string \| Promise<string>` | 动态路由，返回下一个 NodeName 或 `"__END__"` |
+| `GraphExecutionResult<T>` | `{ finalState: T; trajectory: string[]; iterations: number }` | 最终状态、全量跳转轨迹、迭代次数 |
+| `ctx.graph.create<T>(maxIterations?)` | → `StateGraph<T>` | 创建隔离的图实例 |
+
+### 事件（`ctx.on("graph/…")` 订阅）
+
+| 事件 | 载荷 | 时机 |
+| --- | --- | --- |
+| `graph/start` | `{ initialState, entryPoint }` | 图开始执行 |
+| `graph/node-start` | `{ node, state, iteration }` | 每个节点执行前 |
+| `graph/node-end` | `{ node, state }` | 节点补丁合并后 |
+| `graph/node-error` | `{ node, error }` | 节点抛错（随后上抛） |
+| `graph/error` | `{ error, state, lastNode }` | 迭代熔断触发 |
+| `graph/end` | `{ finalState, trajectory, iterations }` | 图正常结束 |
+
+`logTrajectory` 开启时，插件订阅 `node-start`（debug 级）与 `end`（info 级）把轨迹写入 `ctx.logger("graph")`。
+
+## 安装
+
+作为一个 bundle 包装进某个 profile：
+
+```sh
+# 发布后
+dsh plugin --profile web add dsh-state-graph
+
+# 本地开发（file: 链接）
+# 在 $DSH_HOME/profiles/<name>/package.json 加依赖并安装
+```
+
+profile 的 `dsh.profile.bundles` 需要包含 `dsh-state-graph`（与 `@deepseek-ai/dsh-base` 一起）。插件无其他注入依赖，任何 profile 均可加载。
+
+## 配置（`cordis.patch.yml` 的 `config`）
+
+```yaml
+- insert:
+    - id: state-graph
+      name: 'dsh-state-graph'
+      config:
+        defaultMaxIterations: 25   # 防死循环单次执行最大迭代上限
+        logTrajectory: true        # 输出路由轨迹到日志总线
+```
+
+## 用法示例：代码生成与双向对齐检查图
+
+```ts
+import { Context } from "@deepseek-ai/cordis";
+
+// 在其他插件 / 工具 / 命令中：
+export function buildGraph(ctx: Context) {
+  return ctx.graph
+    .create() // 隔离实例，maxIterations 默认取插件配置
+    .addNode("generate_code", async (s, ctx) => {
+      const code = await llmGenerate(ctx, s.task); // 任何业务
+      return { code, rev: s.rev + 1 };
+    })
+    .addNode("static_analyze", (s) => ({ lintOk: lint(s.code).ok }))
+    .addNode("run_unit_test", async (s, ctx) => ({
+      testOk: (await runTests(ctx, s.code)).passed,
+    }))
+    .addEdge("generate_code", "static_analyze")
+    .addEdge("static_analyze", "run_unit_test")
+    .addConditionalEdge("static_analyze", (s) =>
+      s.lintOk ? "run_unit_test" : "generate_code",
+    )
+    .addConditionalEdge("run_unit_test", (s) =>
+      s.testOk ? "__END__" : "generate_code",
+    )
+    .setEntryPoint("generate_code");
+
+  const { finalState, trajectory, iterations } = await graph.run({ rev: 0, task });
+  ctx.logger("app").info(`route: ${trajectory.join(" -> ")} (${iterations} steps)`);
+}
+```
+
+条件路由返回 `"__END__"` 或静态边指向未注册节点名时行为：条件边优先于静态边；无出边或返回 `"__END__"` 即终止。
+
+## 运维与性能考量
+
+1. **状态合并策略**：默认浅拷贝 + 结构补丁合并（`{ ...state, ...patch }`）。大对象（文件内容、仓库快照）建议经引用路径或沙箱虚拟文件系统管理，避免全量复制造成 GC 压力。
+2. **异步超时控制**：引擎层面只做迭代熔断；单个 NodeHandler 若调用工具 / 外部服务，应在 handler 内自行包装 `AbortSignal` 与超时定时器，防止阻塞挂起整个图。
+3. **观测**：节点级耗时分析 = 同一节点相邻 `node-start` / `node-end` 事件时间差；执行流回放 = 按序消费 `graph/*` 事件。
+
+## 开发
+
+```sh
+npm install
+npm run build        # tsc → lib/
+npm run typecheck
+npm run smoke        # build + 冒烟测试（设计文档 §5 工作流 + 熔断/入口校验/事件流）
+```
+
+## 许可
+
+MIT。实现遵循《DeepSeek Harness (dsh) 状态图（StateGraph）编排引擎技术方案与架构设计》。
