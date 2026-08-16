@@ -22,10 +22,12 @@ addNode / addEdge / addConditionalEdge → 纯函数增量补丁 → 迭代熔�
 
 | 接口 / 类型 | 签名 | 说明 |
 | --- | --- | --- |
-| `NodeHandler<T>` | `(state: T, ctx: Context) => Promise<Partial<T>> \| Partial<T>` | 节点业务执行体，返回需合并的状态增量 |
-| `ConditionHandler<T>` | `(state: T, ctx: Context) => string \| Promise<string>` | 动态路由，返回下一个 NodeName 或 `"__END__"` |
+| `NodeHandler<T>` | `(state: T, ctx: Context, signal?: AbortSignal) => Promise<Partial<T>> \| Partial<T>` | 节点业务执行体，返回需合并的状态增量；第二参数仍为 `ctx`，第三参数接收本次运行的取消信号 |
+| `ConditionHandler<T>` | `(state: T, ctx: Context, signal?: AbortSignal) => string \| Promise<string>` | 动态路由，返回下一个 NodeName 或 `"__END__"`；第二参数仍为 `ctx`，第三参数接收本次运行的取消信号 |
 | `GraphExecutionResult<T>` | `{ graphId: string; finalState: T; trajectory: string[]; iterations: number }` | 实例标识、最终状态、全量跳转轨迹、迭代次数 |
 | `ctx.graph.create<T>(maxIterations?)` | → `StateGraph<T>` | 创建隔离的图实例 |
+
+一次运行可通过 `run(initialState, { signal })` 传入 `AbortSignal`；不传第二参数时保持原有调用方式。引擎会在节点执行、节点结果合并、条件路由以及跳转边界检查取消状态，并把同一个 signal 作为 `NodeHandler` / `ConditionHandler` 的第三参数传入。
 
 ### 事件（`ctx.on("graph/…")` 订阅）
 
@@ -76,8 +78,8 @@ import { Context } from "@deepseek-ai/cordis";
 export function buildGraph(ctx: Context) {
   return ctx.graph
     .create() // 隔离实例，maxIterations 默认取插件配置
-    .addNode("generate_code", async (s, ctx) => {
-      const code = await llmGenerate(ctx, s.task); // 任何业务
+    .addNode("generate_code", async (s, ctx, signal) => {
+      const code = await llmGenerate(ctx, s.task, signal); // 业务函数自行遵守 signal
       return { code, rev: s.rev + 1 };
     })
     .addNode("static_analyze", (s) => ({ lintOk: lint(s.code).ok }))
@@ -86,9 +88,10 @@ export function buildGraph(ctx: Context) {
     }))
     .addEdge("generate_code", "static_analyze")
     .addEdge("static_analyze", "run_unit_test")
-    .addConditionalEdge("static_analyze", (s) =>
-      s.lintOk ? "run_unit_test" : "generate_code",
-    )
+    .addConditionalEdge("static_analyze", (s, _ctx, signal) => {
+      signal?.throwIfAborted();
+      return s.lintOk ? "run_unit_test" : "generate_code";
+    })
     .addConditionalEdge("run_unit_test", (s) =>
       s.testOk ? "__END__" : "generate_code",
     )
@@ -97,7 +100,11 @@ export function buildGraph(ctx: Context) {
 
 // 使用：
 const graph = buildGraph(ctx);
-const { finalState, trajectory, iterations } = await graph.run({ rev: 0, task });
+const controller = new AbortController();
+const { finalState, trajectory, iterations } = await graph.run(
+  { rev: 0, task },
+  { signal: controller.signal },
+);
 ctx.logger("app").info(`route: ${trajectory.join(" -> ")} (${iterations} steps)`);
 ```
 
@@ -106,7 +113,7 @@ ctx.logger("app").info(`route: ${trajectory.join(" -> ")} (${iterations} steps)`
 ## 运维与性能考量
 
 1. **状态合并策略**：默认浅拷贝 + 结构补丁合并（`{ ...state, ...patch }`）。大对象（文件内容、仓库快照）建议经引用路径或沙箱虚拟文件系统管理，避免全量复制造成 GC 压力。
-2. **异步超时控制**：引擎层面只做迭代熔断；单个 NodeHandler 若调用工具 / 外部服务，应在 handler 内自行包装 `AbortSignal` 与超时定时器，防止阻塞挂起整个图。
+2. **取消与异步超时控制**：`run(initialState, { signal })` 是合作式取消。引擎只在节点、路由和图遍历边界检查 signal，不会强杀忽略 signal 的普通 Promise；NodeHandler / ConditionHandler 也应把第三参数传给所调用的 LLM、工具或外部服务。引擎不内置单节点超时，单节点超时仍由调用方或 handler 自行组合 `AbortSignal` 与定时器。
 3. **观测**：节点级耗时分析 = 同一节点相邻 `node-start` / `node-end` 事件时间差；执行流回放 = 按序消费 `graph/*` 事件。
 
 ## 开发

@@ -9,6 +9,7 @@ import z from "@deepseek-ai/schemastery";
 export type NodeHandler<TState = any> = (
   state: TState,
   ctx: Context,
+  signal?: AbortSignal,
 ) => Promise<Partial<TState>> | Partial<TState>;
 
 /**
@@ -17,6 +18,7 @@ export type NodeHandler<TState = any> = (
 export type ConditionHandler<TState = any> = (
   state: TState,
   ctx: Context,
+  signal?: AbortSignal,
 ) => string | Promise<string>;
 
 /** 图执行终止哨兵（与静态边 / 条件路由共用）。 */
@@ -30,7 +32,13 @@ export interface GraphDefinition<TState = any> {
   maxIterations: number;
 }
 
-/** 图执行完成后的最终产物及全量跳转轨迹。graphId 标识实例，区分并发图的同名节点。 */
+/** Optional controls for one graph execution. */
+export interface GraphRunOptions {
+  /** Cooperative cancellation for nodes, routes, and graph traversal. */
+  signal?: AbortSignal;
+}
+
+/** 图执行完成后的最终产物及全量跳转轨迹。graphId 标识本次执行，区分重复/并发轨迹。 */
 export interface GraphExecutionResult<TState = any> {
   graphId: string;
   finalState: TState;
@@ -102,7 +110,10 @@ declare module "@deepseek-ai/cordis" {
  * 熔断，超限抛错并发出 graph/error 事件。
  */
 export class StateGraph<TState extends Record<string, any>> {
-  /** 本实例的唯一执行标识：注入 graph/* 事件载荷，区分并发图的同名节点轨迹。 */
+  /**
+   * 本实例的唯一标识，保留用于兼容已有调用方；graph/* 事件载荷使用每次
+   * run() 独立生成的 graphId，以区分同一图的重复/并发执行轨迹。
+   */
   readonly id: string;
 
   private def: GraphDefinition<TState> = {
@@ -113,6 +124,7 @@ export class StateGraph<TState extends Record<string, any>> {
   };
 
   constructor(private ctx: Context, maxIterations = 25) {
+    assertValidMaxIterations(maxIterations);
     this.id = `graph-${randomBytes(8).toString("hex")}`;
     this.def.maxIterations = maxIterations;
   }
@@ -140,23 +152,34 @@ export class StateGraph<TState extends Record<string, any>> {
     return this;
   }
 
-  async run(initialState: TState): Promise<GraphExecutionResult<TState>> {
+  async run(
+    initialState: TState,
+    options: GraphRunOptions = {},
+  ): Promise<GraphExecutionResult<TState>> {
+    const signal = options.signal;
+    signal?.throwIfAborted();
+
     if (!this.def.entryPoint || !this.def.nodes.has(this.def.entryPoint)) {
       throw new Error("Graph must specify a valid registered entryPoint.");
     }
 
+    assertValidMaxIterations(this.def.maxIterations);
+    const graphId = `graph-${randomBytes(8).toString("hex")}`;
     let currentNode: string | undefined = this.def.entryPoint;
     let state: TState = { ...initialState };
     const trajectory: string[] = [];
     let iterations = 0;
 
     this.ctx.emit("graph/start", {
-      graphId: this.id,
+      graphId,
       initialState,
       entryPoint: this.def.entryPoint,
     });
+    signal?.throwIfAborted();
 
     while (currentNode && currentNode !== END) {
+      signal?.throwIfAborted();
+
       // 熔断边界语义：maxIterations 指"最多执行的迭代次数"；第 maxIterations+1 次
       // 进入此处时检查并抛错终止（第 N 次仍会执行完），超限发 graph/error。
       if (++iterations > this.def.maxIterations) {
@@ -164,7 +187,7 @@ export class StateGraph<TState extends Record<string, any>> {
           `Max iteration limit (${this.def.maxIterations}) exceeded. Cyclic loop terminated.`,
         );
         this.ctx.emit("graph/error", {
-          graphId: this.id,
+          graphId,
           error: err,
           state,
           lastNode: currentNode,
@@ -173,12 +196,14 @@ export class StateGraph<TState extends Record<string, any>> {
       }
 
       trajectory.push(currentNode);
+      signal?.throwIfAborted();
       this.ctx.emit("graph/node-start", {
-        graphId: this.id,
+        graphId,
         node: currentNode,
         state,
         iteration: iterations,
       });
+      signal?.throwIfAborted();
 
       const handler = this.def.nodes.get(currentNode);
       if (!handler) {
@@ -186,7 +211,7 @@ export class StateGraph<TState extends Record<string, any>> {
         // 让轨迹观察者收到失败终结，而非静默无终态。
         const err = new Error(`Handler for node "${currentNode}" is missing.`);
         this.ctx.emit("graph/error", {
-          graphId: this.id,
+          graphId,
           error: err,
           state,
           lastNode: currentNode,
@@ -195,16 +220,18 @@ export class StateGraph<TState extends Record<string, any>> {
       }
 
       try {
-        const patch = await handler(state, this.ctx);
+        const patch = await handler(state, this.ctx, signal);
+        signal?.throwIfAborted();
         state = { ...state, ...patch };
         this.ctx.emit("graph/node-end", {
-          graphId: this.id,
+          graphId,
           node: currentNode,
           state,
         });
+        signal?.throwIfAborted();
       } catch (nodeErr) {
         this.ctx.emit("graph/node-error", {
-          graphId: this.id,
+          graphId,
           node: currentNode,
           error: nodeErr,
         });
@@ -212,9 +239,11 @@ export class StateGraph<TState extends Record<string, any>> {
       }
 
       try {
+        signal?.throwIfAborted();
         if (this.def.conditionalEdges.has(currentNode)) {
           const router: ConditionHandler<TState> = this.def.conditionalEdges.get(currentNode)!;
-          const next = await router(state, this.ctx);
+          const next = await router(state, this.ctx, signal);
+          signal?.throwIfAborted();
           // 路由返回值必须是已注册节点名或 END 哨兵：undefined（忘写 return）、
           // 非字符串、未注册名一律视为路由错误，与"未注册节点名抛错"同一语义，
           // 不能静默当作正常终止（否则路由 bug 会被洗成 graph/end"成功"）。
@@ -231,12 +260,13 @@ export class StateGraph<TState extends Record<string, any>> {
         } else {
           currentNode = END;
         }
+        signal?.throwIfAborted();
       } catch (routeErr) {
         // 路由函数抛错（或上方校验抛错）：补发 graph/error（此前无任何终态事件）后再上抛。
         const err =
           routeErr instanceof Error ? routeErr : new Error(String(routeErr));
         this.ctx.emit("graph/error", {
-          graphId: this.id,
+          graphId,
           error: err,
           state,
           // 循环不变量保证 currentNode 为已注册节点名（while 条件已收窄）；catch 内
@@ -248,13 +278,22 @@ export class StateGraph<TState extends Record<string, any>> {
     }
 
     // graph/end 仅在正常终止（END 或无出边）时发出；异常终止一律走 graph/error。
+    signal?.throwIfAborted();
     this.ctx.emit("graph/end", {
-      graphId: this.id,
+      graphId,
       finalState: state,
       trajectory,
       iterations,
     });
-    return { graphId: this.id, finalState: state, trajectory, iterations };
+    return { graphId, finalState: state, trajectory, iterations };
+  }
+}
+
+function assertValidMaxIterations(value: number): void {
+  if (!Number.isFinite(value) || !Number.isInteger(value) || value <= 0) {
+    throw new RangeError(
+      `maxIterations must be a finite positive integer, got ${String(value)}.`,
+    );
   }
 }
 
@@ -274,6 +313,8 @@ export default class GraphEngineService extends Service {
   static Config: z<Config> = z.object({
     defaultMaxIterations: z
       .number()
+      .min(1)
+      .step(1)
       .default(25)
       .description("默认防死循环单次执行最大迭代上限"),
     logTrajectory: z
@@ -284,6 +325,7 @@ export default class GraphEngineService extends Service {
 
   constructor(ctx: Context, public config: Config) {
     super(ctx, "graph");
+    assertValidMaxIterations(config.defaultMaxIterations);
 
     if (config.logTrajectory) {
       ctx.on("graph/node-start", ({ node, iteration }) => {
