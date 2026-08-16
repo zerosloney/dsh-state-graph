@@ -1,6 +1,6 @@
 # dsh-state-graph
 
-把 **StateGraph 有向状态图编排引擎**移植为 **DeepSeek Harness (dsh) 插件**：用声明式的节点 / 静态边 / 条件边把 Harness 单向线性的 ReAct 调度提升为支持多分支条件路由、循环重试、子图嵌套及并发汇聚的图编排运行时。
+把 **StateGraph 有向状态图编排引擎**移植为 **DeepSeek Harness (dsh) 插件**：用声明式的节点 / 静态边 / 条件边把 Harness 单向线性的 ReAct 调度提升为支持多分支条件路由、循环重试与迭代熔断的图编排运行时（子图嵌套可经节点内调用 `ctx.graph.create()` 组合实现；并行汇聚暂未内置）。
 
 ```text
 addNode / addEdge / addConditionalEdge → 纯函数增量补丁 → 迭代熔断 → 轨迹事件流
@@ -24,19 +24,21 @@ addNode / addEdge / addConditionalEdge → 纯函数增量补丁 → 迭代熔�
 | --- | --- | --- |
 | `NodeHandler<T>` | `(state: T, ctx: Context) => Promise<Partial<T>> \| Partial<T>` | 节点业务执行体，返回需合并的状态增量 |
 | `ConditionHandler<T>` | `(state: T, ctx: Context) => string \| Promise<string>` | 动态路由，返回下一个 NodeName 或 `"__END__"` |
-| `GraphExecutionResult<T>` | `{ finalState: T; trajectory: string[]; iterations: number }` | 最终状态、全量跳转轨迹、迭代次数 |
+| `GraphExecutionResult<T>` | `{ graphId: string; finalState: T; trajectory: string[]; iterations: number }` | 实例标识、最终状态、全量跳转轨迹、迭代次数 |
 | `ctx.graph.create<T>(maxIterations?)` | → `StateGraph<T>` | 创建隔离的图实例 |
 
 ### 事件（`ctx.on("graph/…")` 订阅）
 
 | 事件 | 载荷 | 时机 |
 | --- | --- | --- |
-| `graph/start` | `{ initialState, entryPoint }` | 图开始执行 |
-| `graph/node-start` | `{ node, state, iteration }` | 每个节点执行前 |
-| `graph/node-end` | `{ node, state }` | 节点补丁合并后 |
-| `graph/node-error` | `{ node, error }` | 节点抛错（随后上抛） |
-| `graph/error` | `{ error, state, lastNode }` | 迭代熔断触发 |
-| `graph/end` | `{ finalState, trajectory, iterations }` | 图正常结束 |
+| `graph/start` | `{ graphId, initialState, entryPoint }` | 图开始执行 |
+| `graph/node-start` | `{ graphId, node, state, iteration }` | 每个节点执行前 |
+| `graph/node-end` | `{ graphId, node, state }` | 节点补丁合并后 |
+| `graph/node-error` | `{ graphId, node, error }` | 节点抛错（随后上抛） |
+| `graph/error` | `{ graphId, error, state, lastNode }` | 迭代熔断 / 目标节点缺失 / 路由抛错 |
+| `graph/end` | `{ graphId, finalState, trajectory, iterations }` | 仅正常终止（END 或无出边） |
+
+`graphId` 标识每次执行的图实例，用于区分并发图之间可能重名的节点轨迹。`graph/end` 只在正常终止时发出；**所有异常终止（节点抛错除外，走 `graph/node-error`）统一发 `graph/error` 后上抛**——包括迭代熔断、条件路由返回未注册节点名、路由函数抛错。
 
 `logTrajectory` 开启时，插件订阅 `node-start`（debug 级）与 `end`（info 级）把轨迹写入 `ctx.logger("graph")`。
 
@@ -91,13 +93,15 @@ export function buildGraph(ctx: Context) {
       s.testOk ? "__END__" : "generate_code",
     )
     .setEntryPoint("generate_code");
-
-  const { finalState, trajectory, iterations } = await graph.run({ rev: 0, task });
-  ctx.logger("app").info(`route: ${trajectory.join(" -> ")} (${iterations} steps)`);
 }
+
+// 使用：
+const graph = buildGraph(ctx);
+const { finalState, trajectory, iterations } = await graph.run({ rev: 0, task });
+ctx.logger("app").info(`route: ${trajectory.join(" -> ")} (${iterations} steps)`);
 ```
 
-条件路由返回 `"__END__"` 或静态边指向未注册节点名时行为：条件边优先于静态边；无出边或返回 `"__END__"` 即终止。
+条件边优先于静态边；无出边或条件路由返回 `"__END__"` 即终止。**条件路由返回未注册节点名、非字符串或 `undefined`（如忘写 return）时抛错并发 `graph/error`**（熔断语义同上，非静默终止）。
 
 ## 运维与性能考量
 
@@ -112,6 +116,7 @@ npm install
 npm run build        # tsc → lib/
 npm run typecheck
 npm run smoke        # build + 冒烟测试（设计文档 §5 工作流 + 熔断/入口校验/事件流）
+npm test             # build + node --test（StateGraph.run 全流程 7 用例，stub ctx 驱动）
 ```
 
 ## 许可
