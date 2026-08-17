@@ -24,7 +24,7 @@ addNode / addEdge / addConditionalEdge → 纯函数增量补丁 → 迭代熔�
 | --- | --- | --- |
 | `NodeHandler<T>` | `(state: T, ctx: Context, signal?: AbortSignal) => Promise<Partial<T>> \| Partial<T>` | 节点业务执行体，返回需合并的状态增量；第二参数仍为 `ctx`，第三参数接收本次运行的取消信号 |
 | `ConditionHandler<T>` | `(state: T, ctx: Context, signal?: AbortSignal) => string \| Promise<string>` | 动态路由，返回下一个 NodeName 或 `"__END__"`；第二参数仍为 `ctx`，第三参数接收本次运行的取消信号 |
-| `GraphExecutionResult<T>` | `{ graphId: string; finalState: T; trajectory: string[]; iterations: number }` | 实例标识、最终状态、全量跳转轨迹、迭代次数 |
+| `GraphExecutionResult<T>` | `{ graphId: string; finalState: T; trajectory: string[]; iterations: number }` | 每次执行的 graphId（区分重复/并发轨迹）、最终状态、全量跳转轨迹、迭代次数 |
 | `ctx.graph.create<T>(maxIterations?)` | → `StateGraph<T>` | 创建隔离的图实例 |
 
 一次运行可通过 `run(initialState, { signal })` 传入 `AbortSignal`；不传第二参数时保持原有调用方式。引擎会在节点执行、节点结果合并、条件路由以及跳转边界检查取消状态，并把同一个 signal 作为 `NodeHandler` / `ConditionHandler` 的第三参数传入。
@@ -36,11 +36,11 @@ addNode / addEdge / addConditionalEdge → 纯函数增量补丁 → 迭代熔�
 | `graph/start` | `{ graphId, initialState, entryPoint }` | 图开始执行 |
 | `graph/node-start` | `{ graphId, node, state, iteration }` | 每个节点执行前 |
 | `graph/node-end` | `{ graphId, node, state }` | 节点补丁合并后 |
-| `graph/node-error` | `{ graphId, node, error }` | 节点抛错（随后上抛） |
-| `graph/error` | `{ graphId, error, state, lastNode }` | 迭代熔断 / 目标节点缺失 / 路由抛错 |
+| `graph/node-error` | `{ graphId, node, error }` | 节点抛错或被取消中断（随后上抛；取消还会补发 `graph/error`） |
+| `graph/error` | `{ graphId, error, state, lastNode }` | 迭代熔断 / 目标节点缺失 / 路由抛错 / 取消（`graph/start` 之后） |
 | `graph/end` | `{ graphId, finalState, trajectory, iterations }` | 仅正常终止（END 或无出边） |
 
-`graphId` 标识每次执行的图实例，用于区分并发图之间可能重名的节点轨迹。`graph/end` 只在正常终止时发出；**所有异常终止（节点抛错除外，走 `graph/node-error`）统一发 `graph/error` 后上抛**——包括迭代熔断、条件路由返回未注册节点名、路由函数抛错。
+`graphId` 标识每次执行（同一图实例的重复/并发运行各自独立生成），用于区分并发图之间可能重名的节点轨迹。`graph/end` 只在正常终止时发出；**所有异常终止统一发 `graph/error` 后上抛**——包括迭代熔断、条件路由返回未注册节点名/非字符串、路由函数抛错，以及 `graph/start` 之后的取消（节点执行中的取消先发 `graph/node-error` 过程诊断、再发 `graph/error` 终态；`graph/start` 之前的预取消无任何事件）。节点自身业务抛错仅发 `graph/node-error` 后上抛。`graph/*` 监听器同步执行且异常会传播进引擎（cordis `emit` 语义），订阅方不应在监听器中抛错。
 
 `logTrajectory` 开启时，插件订阅 `node-start`（debug 级）与 `end`（info 级）把轨迹写入 `ctx.logger("graph")`。
 
@@ -108,12 +108,12 @@ const { finalState, trajectory, iterations } = await graph.run(
 ctx.logger("app").info(`route: ${trajectory.join(" -> ")} (${iterations} steps)`);
 ```
 
-条件边优先于静态边；无出边或条件路由返回 `"__END__"` 即终止。**条件路由返回未注册节点名、非字符串或 `undefined`（如忘写 return）时抛错并发 `graph/error`**（熔断语义同上，非静默终止）。
+条件边优先于静态边；无出边或条件路由返回 `"__END__"` 即终止。`addEdge` / `addConditionalEdge` 对同一 `from` 重复注册会抛错（与 `addNode` 的重名检查一致）；静态边与条件边可挂在同一节点上，条件边优先生效。**条件路由返回未注册节点名、非字符串或 `undefined`（如忘写 return）时抛错并发 `graph/error`**（熔断语义同上，非静默终止）。
 
 ## 运维与性能考量
 
 1. **状态合并策略**：默认浅拷贝 + 结构补丁合并（`{ ...state, ...patch }`）。大对象（文件内容、仓库快照）建议经引用路径或沙箱虚拟文件系统管理，避免全量复制造成 GC 压力。
-2. **取消与异步超时控制**：`run(initialState, { signal })` 是合作式取消。引擎只在节点、路由和图遍历边界检查 signal，不会强杀忽略 signal 的普通 Promise；NodeHandler / ConditionHandler 也应把第三参数传给所调用的 LLM、工具或外部服务。引擎不内置单节点超时，单节点超时仍由调用方或 handler 自行组合 `AbortSignal` 与定时器。
+2. **取消与异步超时控制**：`run(initialState, { signal })` 是合作式取消。引擎只在节点、路由和图遍历边界检查 signal，不会强杀忽略 signal 的普通 Promise；NodeHandler / ConditionHandler 也应把第三参数传给所调用的 LLM、工具或外部服务。取消的终态事件语义见上文事件表：`graph/start` 之后的取消一律补发 `graph/error`。引擎不内置单节点超时，单节点超时仍由调用方或 handler 自行组合 `AbortSignal` 与定时器。
 3. **观测**：节点级耗时分析 = 同一节点相邻 `node-start` / `node-end` 事件时间差；执行流回放 = 按序消费 `graph/*` 事件。
 
 ## 开发
@@ -123,7 +123,7 @@ npm install
 npm run build        # tsc → lib/
 npm run typecheck
 npm run smoke        # build + 冒烟测试（设计文档 §5 工作流 + 熔断/入口校验/事件流）
-npm test             # build + node --test（StateGraph.run 全流程 7 用例，stub ctx 驱动）
+npm test             # build + node --test（StateGraph.run 全流程与事件契约，stub ctx 驱动）
 ```
 
 ## 许可
