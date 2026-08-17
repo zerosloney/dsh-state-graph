@@ -2,13 +2,20 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import GraphEngineService, { StateGraph, END } from "../lib/index.js";
 
-/** 最小 ctx 桩：StateGraph 运行时只调用 ctx.emit。 */
+/** 最小 ctx 桩：StateGraph 运行时只调用 ctx.emit / ctx.on。 */
 function stubCtx() {
   const events = [];
+  const listeners = [];
   return {
     events,
     emit(name, payload) {
       events.push({ name, payload });
+      for (const { name: n, listener } of listeners) {
+        if (n === name) listener(payload);
+      }
+    },
+    on(name, listener) {
+      listeners.push({ name, listener });
     },
   };
 }
@@ -167,6 +174,73 @@ test("运行中取消：合作型节点拒绝且不发 graph/end", async () => {
 
   await assert.rejects(running, (error) => error === reason);
   assert.ok(!ctx.events.some((event) => event.name === "graph/end"));
+  // 取消终态契约：node-error（过程诊断）+ graph/error（终态），各恰好一次
+  assert.equal(
+    ctx.events.filter((event) => event.name === "graph/node-error").length,
+    1,
+  );
+  const errorEvents = ctx.events.filter((event) => event.name === "graph/error");
+  assert.equal(errorEvents.length, 1);
+  assert.equal(errorEvents[0].payload.error, reason);
+  assert.equal(errorEvents[0].payload.lastNode, "a");
+});
+
+test("路由段取消：补发 graph/error 终态后拒绝", async () => {
+  const ctx = stubCtx();
+  const controller = new AbortController();
+  let markRouting;
+  const routing = new Promise((resolve) => {
+    markRouting = resolve;
+  });
+  const graph = new StateGraph(ctx, 10)
+    .addNode("a", () => ({}))
+    .addConditionalEdge("a", async (_state, _ctx, signal) => {
+      markRouting();
+      await new Promise((_, reject) => {
+        signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+      });
+      return "a";
+    })
+    .setEntryPoint("a");
+
+  const running = graph.run({}, { signal: controller.signal });
+  await routing;
+  const reason = new Error("cancelled while routing");
+  controller.abort(reason);
+
+  await assert.rejects(running, (error) => error === reason);
+  const errorEvents = ctx.events.filter((event) => event.name === "graph/error");
+  assert.equal(errorEvents.length, 1);
+  assert.equal(errorEvents[0].payload.error, reason);
+  assert.equal(errorEvents[0].payload.lastNode, "a");
+  assert.ok(!ctx.events.some((event) => event.name === "graph/end"));
+});
+
+test("graph/start 监听器内同步取消：仍收到 graph/error 终态", async () => {
+  const ctx = stubCtx();
+  const controller = new AbortController();
+  const reason = new Error("cancelled at start");
+  ctx.on("graph/start", () => controller.abort(reason));
+  let called = false;
+  const graph = new StateGraph(ctx, 10)
+    .addNode("a", () => {
+      called = true;
+      return {};
+    })
+    .setEntryPoint("a");
+
+  await assert.rejects(
+    graph.run({}, { signal: controller.signal }),
+    (error) => error === reason,
+  );
+  assert.equal(called, false);
+  // 此前该时点取消会导致 graph/start 之后无任何终态事件
+  assert.deepEqual(ctx.events.map((event) => event.name), [
+    "graph/start",
+    "graph/error",
+  ]);
+  assert.equal(ctx.events[1].payload.error, reason);
+  assert.equal(ctx.events[1].payload.lastNode, "a");
 });
 
 test("迭代熔断：自环超限抛错并补发 graph/error", async () => {
@@ -219,13 +293,68 @@ test("节点抛错：graph/node-error 后上抛，不发 end", async () => {
   assert.ok(!ctx.events.some((e) => e.name === "graph/end"));
 });
 
-test("缺入口/重名节点在 run 前拒绝", async () => {
+test("缺入口/重名节点/重复边在 run 前拒绝", async () => {
   const ctx = stubCtx();
   await assert.rejects(new StateGraph(ctx, 10).addNode("a", () => ({})).run({}), /entryPoint/);
   assert.throws(
     () => new StateGraph(ctx, 10).addNode("a", () => ({})).addNode("a", () => ({})),
     /already registered/,
   );
+  assert.throws(
+    () => new StateGraph(ctx, 10).addEdge("a", "b").addEdge("a", "c"),
+    /already registered/,
+  );
+  assert.throws(
+    () =>
+      new StateGraph(ctx, 10)
+        .addConditionalEdge("a", () => "b")
+        .addConditionalEdge("a", () => "c"),
+    /already registered/,
+  );
+});
+
+test("路由返回 undefined/BigInt：抛非法目标错误且错误消息可读", async () => {
+  const ctx = stubCtx();
+  const ghostRoute = new StateGraph(ctx, 10)
+    .addNode("a", () => ({}))
+    .addConditionalEdge("a", () => undefined)
+    .setEntryPoint("a");
+  await assert.rejects(ghostRoute.run({}), /非法目标：undefined/);
+
+  const bigintRoute = new StateGraph(ctx, 10)
+    .addNode("a", () => ({}))
+    .addConditionalEdge("a", () => 1n)
+    .setEntryPoint("a");
+  // BigInt 不可 JSON 序列化：错误消息构造降级为 String()，不再自抛 TypeError
+  await assert.rejects(bigintRoute.run({}), /非法目标：1/);
+});
+
+test("logTrajectory=true：订阅 node-start/end 输出轨迹日志", () => {
+  const logs = [];
+  const listeners = {};
+  const ctx = {
+    emit() {},
+    on(name, listener) {
+      (listeners[name] ??= []).push(listener);
+    },
+    logger(scope) {
+      return {
+        debug: (message) => logs.push(`[${scope}] debug ${message}`),
+        info: (message) => logs.push(`[${scope}] info ${message}`),
+      };
+    },
+    reflect: { provide() {} },
+  };
+  new GraphEngineService(ctx, { defaultMaxIterations: 25, logTrajectory: true });
+
+  assert.deepEqual(listeners["graph/node-start"].length, 1);
+  assert.deepEqual(listeners["graph/end"].length, 1);
+  listeners["graph/node-start"][0]({ node: "a", iteration: 2 });
+  listeners["graph/end"][0]({ trajectory: ["a", "b"], iterations: 2 });
+  assert.deepEqual(logs, [
+    "[graph] debug [StateGraph] [#2] Running Node: a",
+    "[graph] info [StateGraph] Completed in 2 steps. Route: a -> b",
+  ]);
 });
 
 test("maxIterations：构造与配置边界拒绝非正数、非整数和非有限值", () => {

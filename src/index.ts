@@ -143,11 +143,17 @@ export class StateGraph<TState extends Record<string, any>> {
   }
 
   addEdge(from: string, to: string): this {
+    if (this.def.edges.has(from)) {
+      throw new Error(`Edge from "${from}" already registered.`);
+    }
     this.def.edges.set(from, to);
     return this;
   }
 
   addConditionalEdge(from: string, condition: ConditionHandler<TState>): this {
+    if (this.def.conditionalEdges.has(from)) {
+      throw new Error(`Conditional edge from "${from}" already registered.`);
+    }
     this.def.conditionalEdges.set(from, condition);
     return this;
   }
@@ -163,22 +169,38 @@ export class StateGraph<TState extends Record<string, any>> {
       throw new Error("Graph must specify a valid registered entryPoint.");
     }
 
-    assertValidMaxIterations(this.def.maxIterations);
+    const entryPoint = this.def.entryPoint;
     const graphId = `graph-${randomBytes(8).toString("hex")}`;
-    let currentNode: string | undefined = this.def.entryPoint;
+    let currentNode: string | undefined = entryPoint;
     let state: TState = { ...initialState };
     const trajectory: string[] = [];
     let iterations = 0;
 
+    // 取消终态契约：graph/start 之后的取消在任意时点都补发一次 graph/error 再抛，
+    // 保证轨迹观察者对每次已启动的执行都能收到终结事件（正常 = end，异常/取消 = error）。
+    // graph/start 之前的预取消保持无事件（图尚未启动，无轨迹可终结）。
+    const abortCheckpoint = () => {
+      if (!signal?.aborted) return;
+      const err =
+        signal.reason instanceof Error ? signal.reason : new Error(String(signal.reason));
+      this.ctx.emit("graph/error", {
+        graphId,
+        error: err,
+        state,
+        lastNode: trajectory.length > 0 ? trajectory[trajectory.length - 1] : entryPoint,
+      });
+      throw err;
+    };
+
     this.ctx.emit("graph/start", {
       graphId,
       initialState,
-      entryPoint: this.def.entryPoint,
+      entryPoint,
     });
-    signal?.throwIfAborted();
+    abortCheckpoint();
 
     while (currentNode && currentNode !== END) {
-      signal?.throwIfAborted();
+      abortCheckpoint();
 
       // 熔断边界语义：maxIterations 指"最多执行的迭代次数"；第 maxIterations+1 次
       // 进入此处时检查并抛错终止（第 N 次仍会执行完），超限发 graph/error。
@@ -196,14 +218,14 @@ export class StateGraph<TState extends Record<string, any>> {
       }
 
       trajectory.push(currentNode);
-      signal?.throwIfAborted();
+      abortCheckpoint();
       this.ctx.emit("graph/node-start", {
         graphId,
         node: currentNode,
         state,
         iteration: iterations,
       });
-      signal?.throwIfAborted();
+      abortCheckpoint();
 
       const handler = this.def.nodes.get(currentNode);
       if (!handler) {
@@ -219,24 +241,37 @@ export class StateGraph<TState extends Record<string, any>> {
         throw err;
       }
 
+      // try 只包住节点执行本身：补丁合并与 node-end 发射留在块外，graph/* 监听器
+      // 抛错（cordis emit 同步传播、不隔离）不会被误归类为节点业务错误。
       try {
         const patch = await handler(state, this.ctx, signal);
         signal?.throwIfAborted();
         state = { ...state, ...patch };
-        this.ctx.emit("graph/node-end", {
-          graphId,
-          node: currentNode,
-          state,
-        });
-        signal?.throwIfAborted();
       } catch (nodeErr) {
         this.ctx.emit("graph/node-error", {
           graphId,
           node: currentNode,
           error: nodeErr,
         });
+        // 取消造成的中断：node-error 只是过程诊断，还需补发 graph/error 终态，
+        // 与路由段/检查点取消的语义一致；节点自身业务错误不在此列。
+        if (signal?.aborted) {
+          this.ctx.emit("graph/error", {
+            graphId,
+            error: nodeErr instanceof Error ? nodeErr : new Error(String(nodeErr)),
+            state,
+            lastNode: currentNode,
+          });
+        }
         throw nodeErr;
       }
+
+      this.ctx.emit("graph/node-end", {
+        graphId,
+        node: currentNode,
+        state,
+      });
+      abortCheckpoint();
 
       try {
         signal?.throwIfAborted();
@@ -251,7 +286,7 @@ export class StateGraph<TState extends Record<string, any>> {
             // 只抛错不 emit：错误会被下方 catch 捕获，由它统一补发一次
             // graph/error——否则非法目标会 double-emit。
             throw new Error(
-              `条件路由返回了非法目标：${JSON.stringify(next) ?? String(next)}（必须是已注册节点名或 "__END__"）。`,
+              `条件路由返回了非法目标：${describeRouteTarget(next)}（必须是已注册节点名或 "__END__"）。`,
             );
           }
           currentNode = next;
@@ -277,8 +312,9 @@ export class StateGraph<TState extends Record<string, any>> {
       }
     }
 
-    // graph/end 仅在正常终止（END 或无出边）时发出；异常终止一律走 graph/error。
-    signal?.throwIfAborted();
+    // graph/end 仅在正常终止（END 或无出边）时发出；异常终止发 graph/error
+    // （节点业务错误先发 graph/node-error），取消在任意时点补发 graph/error。
+    abortCheckpoint();
     this.ctx.emit("graph/end", {
       graphId,
       finalState: state,
@@ -294,6 +330,15 @@ function assertValidMaxIterations(value: number): void {
     throw new RangeError(
       `maxIterations must be a finite positive integer, got ${String(value)}.`,
     );
+  }
+}
+
+/** 路由返回值的安全描述：BigInt/循环引用等不可 JSON 序列化的值降级为 String()。 */
+function describeRouteTarget(value: unknown): string {
+  try {
+    return JSON.stringify(value) ?? String(value);
+  } catch {
+    return String(value);
   }
 }
 
