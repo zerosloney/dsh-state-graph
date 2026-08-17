@@ -19,3 +19,4 @@ jobs:
           node-version: ${{ matrix.node }}
       - run: npm install --no-audit --no-fund
       - run: npm test
+      - run: npm run smoke

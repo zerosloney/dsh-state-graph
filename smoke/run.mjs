@@ -73,4 +73,3 @@ console.log(
   "smoke ok:",
   JSON.stringify({ trajectory: result.trajectory, iterations: result.iterations }),
 );
-process.exit(0);
