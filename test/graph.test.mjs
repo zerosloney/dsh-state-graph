@@ -372,3 +372,80 @@ test("maxIterations：构造与配置边界拒绝非正数、非整数和非有�
     );
   }
 });
+
+test("graph/node-end 包含 durationMs 和 patch 增量", async () => {
+  const ctx = stubCtx();
+  const graph = new StateGraph(ctx, 10)
+    .addNode("calc", async () => {
+      await sleep(10);
+      return { score: 100 };
+    })
+    .setEntryPoint("calc");
+  const result = await graph.run({});
+  assert.equal(result.finalState.score, 100);
+  const endEvent = ctx.events.find((e) => e.name === "graph/node-end");
+  assert.ok(endEvent);
+  assert.equal(endEvent.payload.node, "calc");
+  assert.deepEqual(endEvent.payload.patch, { score: 100 });
+  assert.ok(typeof endEvent.payload.durationMs === "number" && endEvent.payload.durationMs >= 5);
+});
+
+test("addSubgraph: 嵌套子图声明式组合与状态映射", async () => {
+  const ctx = stubCtx();
+  const subGraph = new StateGraph(ctx, 5)
+    .addNode("sub_step", (s) => ({ subCount: (s.subCount ?? 0) + 10 }))
+    .setEntryPoint("sub_step");
+
+  const mainGraph = new StateGraph(ctx, 10)
+    .addNode("init", () => ({ count: 1 }))
+    .addSubgraph("nested", subGraph, {
+      inputMapper: (mainState) => ({ subCount: mainState.count }),
+      outputMapper: (subState, mainState) => ({
+        count: mainState.count,
+        subResult: subState.subCount,
+      }),
+    })
+    .addEdge("init", "nested")
+    .setEntryPoint("init");
+
+  const result = await mainGraph.run({});
+  assert.equal(result.finalState.count, 1);
+  assert.equal(result.finalState.subResult, 11);
+  assert.deepEqual(result.trajectory, ["init", "nested"]);
+});
+
+test("Fan-out / Fan-in: 条件路由返回并行目标数组并汇聚", async () => {
+  const ctx = stubCtx();
+  let executedA = false;
+  let executedB = false;
+
+  const graph = new StateGraph(ctx, 10)
+    .addNode("split", () => ({ init: true }))
+    .addNode("branch_a", async (s) => {
+      await sleep(5);
+      executedA = true;
+      return { fromA: true };
+    })
+    .addNode("branch_b", async (s) => {
+      await sleep(5);
+      executedB = true;
+      return { fromB: true };
+    })
+    .addNode("join", (s) => ({
+      joined: true,
+      allOk: s.fromA && s.fromB,
+    }))
+    .addConditionalEdge("split", () => ["branch_a", "branch_b"])
+    .addEdge("branch_b", "join")
+    .setEntryPoint("split");
+
+  const result = await graph.run({});
+  assert.equal(executedA, true);
+  assert.equal(executedB, true);
+  assert.equal(result.finalState.fromA, true);
+  assert.equal(result.finalState.fromB, true);
+  assert.equal(result.finalState.joined, true);
+  assert.equal(result.finalState.allOk, true);
+  assert.deepEqual(result.trajectory, ["split", "branch_a", "branch_b", "join"]);
+});
+

@@ -13,13 +13,13 @@ export type NodeHandler<TState = any> = (
 ) => Promise<Partial<TState>> | Partial<TState>;
 
 /**
- * 动态路由判断：返回下一个目标 NodeName，或返回 "__END__" 终止图执行。
+ * 动态路由判断：返回下一个目标 NodeName 或并行目标数组，或返回 "__END__" 终止图执行。
  */
 export type ConditionHandler<TState = any> = (
   state: TState,
   ctx: Context,
   signal?: AbortSignal,
-) => string | Promise<string>;
+) => string | string[] | Promise<string | string[]>;
 
 /** 图执行终止哨兵（与静态边 / 条件路由共用）。 */
 export const END = "__END__";
@@ -36,6 +36,14 @@ export interface GraphDefinition<TState = any> {
 export interface GraphRunOptions {
   /** Cooperative cancellation for nodes, routes, and graph traversal. */
   signal?: AbortSignal;
+}
+
+/** Options for embedding a subgraph. */
+export interface SubgraphOptions<TState, TSubState> {
+  /** Map parent graph state into the initial state for the subgraph. Defaults to identity. */
+  inputMapper?: (state: TState) => TSubState;
+  /** Map subgraph final state back to parent state patch. Defaults to identity. */
+  outputMapper?: (subState: TSubState, parentState: TState) => Partial<TState>;
 }
 
 /** 图执行完成后的最终产物及全量跳转轨迹。graphId 标识本次执行，区分重复/并发轨迹。 */
@@ -65,6 +73,8 @@ export interface GraphNodeEndEvent<TState = any> {
   graphId: string;
   node: string;
   state: TState;
+  durationMs?: number;
+  patch?: Partial<TState>;
 }
 
 export interface GraphNodeErrorEvent {
@@ -135,6 +145,27 @@ export class StateGraph<TState extends Record<string, any>> {
     }
     this.def.nodes.set(name, handler);
     return this;
+  }
+
+  /**
+   * 注册一个嵌套子图作为节点：自动将父图的 signal 传递给子图，
+   * 并支持输入/输出状态映射。
+   */
+  addSubgraph<TSubState extends Record<string, any>>(
+    name: string,
+    subgraph: StateGraph<TSubState>,
+    options?: SubgraphOptions<TState, TSubState>,
+  ): this {
+    const inputMapper =
+      options?.inputMapper ?? ((s: TState) => s as unknown as TSubState);
+    const outputMapper =
+      options?.outputMapper ??
+      ((subState: TSubState) => subState as unknown as Partial<TState>);
+    return this.addNode(name, async (state, _ctx, signal) => {
+      const initialSubState = inputMapper(state);
+      const subResult = await subgraph.run(initialSubState, { signal });
+      return outputMapper(subResult.finalState, state);
+    });
   }
 
   setEntryPoint(nodeName: string): this {
@@ -243,9 +274,13 @@ export class StateGraph<TState extends Record<string, any>> {
 
       // try 只包住节点执行本身：补丁合并与 node-end 发射留在块外，graph/* 监听器
       // 抛错（cordis emit 同步传播、不隔离）不会被误归类为节点业务错误。
+      let patch: Partial<TState> | undefined;
+      let durationMs = 0;
       try {
-        const patch = await handler(state, this.ctx, signal);
+        const startTime = Date.now();
+        patch = await handler(state, this.ctx, signal);
         signal?.throwIfAborted();
+        durationMs = Date.now() - startTime;
         state = { ...state, ...patch };
       } catch (nodeErr) {
         this.ctx.emit("graph/node-error", {
@@ -270,6 +305,8 @@ export class StateGraph<TState extends Record<string, any>> {
         graphId,
         node: currentNode,
         state,
+        durationMs,
+        patch,
       });
       abortCheckpoint();
 
@@ -279,17 +316,107 @@ export class StateGraph<TState extends Record<string, any>> {
           const router: ConditionHandler<TState> = this.def.conditionalEdges.get(currentNode)!;
           const next = await router(state, this.ctx, signal);
           signal?.throwIfAborted();
-          // 路由返回值必须是已注册节点名或 END 哨兵：undefined（忘写 return）、
-          // 非字符串、未注册名一律视为路由错误，与"未注册节点名抛错"同一语义，
-          // 不能静默当作正常终止（否则路由 bug 会被洗成 graph/end"成功"）。
-          if (typeof next !== "string" || (next !== END && !this.def.nodes.has(next))) {
-            // 只抛错不 emit：错误会被下方 catch 捕获，由它统一补发一次
-            // graph/error——否则非法目标会 double-emit。
-            throw new Error(
-              `条件路由返回了非法目标：${describeRouteTarget(next)}（必须是已注册节点名或 "__END__"）。`,
-            );
+
+          if (Array.isArray(next)) {
+            if (next.length === 0) {
+              currentNode = END;
+            } else {
+              for (const target of next) {
+                if (typeof target !== "string" || (target !== END && !this.def.nodes.has(target))) {
+                  throw new Error(
+                    `条件路由返回了非法目标：${describeRouteTarget(target)}（必须是已注册节点名或 "__END__"）。`,
+                  );
+                }
+              }
+              const validTargets = next.filter((t) => t !== END);
+              if (validTargets.length === 0) {
+                currentNode = END;
+              } else if (validTargets.length === 1) {
+                currentNode = validTargets[0];
+              } else {
+                // 并行分支汇聚（Fan-out）：并发执行各目标节点
+                abortCheckpoint();
+                if (++iterations > this.def.maxIterations) {
+                  const err = new Error(
+                    `Max iteration limit (${this.def.maxIterations}) exceeded. Cyclic loop terminated.`,
+                  );
+                  this.ctx.emit("graph/error", {
+                    graphId,
+                    error: err,
+                    state,
+                    lastNode: validTargets.join(","),
+                  });
+                  throw err;
+                }
+                trajectory.push(...validTargets);
+                const parallelResults = await Promise.all(
+                  validTargets.map(async (target) => {
+                    abortCheckpoint();
+                    this.ctx.emit("graph/node-start", {
+                      graphId,
+                      node: target,
+                      state,
+                      iteration: iterations,
+                    });
+                    const h = this.def.nodes.get(target)!;
+                    const startTime = Date.now();
+                    try {
+                      const branchPatch = await h(state, this.ctx, signal);
+                      signal?.throwIfAborted();
+                      const branchDuration = Date.now() - startTime;
+                      return { target, patch: branchPatch, durationMs: branchDuration };
+                    } catch (nodeErr) {
+                      this.ctx.emit("graph/node-error", {
+                        graphId,
+                        node: target,
+                        error: nodeErr,
+                      });
+                      if (signal?.aborted) {
+                        this.ctx.emit("graph/error", {
+                          graphId,
+                          error: nodeErr instanceof Error ? nodeErr : new Error(String(nodeErr)),
+                          state,
+                          lastNode: target,
+                        });
+                      }
+                      throw nodeErr;
+                    }
+                  }),
+                );
+                for (const { target, patch: branchPatch, durationMs: branchDuration } of parallelResults) {
+                  state = { ...state, ...branchPatch };
+                  this.ctx.emit("graph/node-end", {
+                    graphId,
+                    node: target,
+                    state,
+                    durationMs: branchDuration,
+                    patch: branchPatch,
+                  });
+                }
+                abortCheckpoint();
+                // 汇聚跳转：寻找并行节点中定义的出边（Join Node）
+                let nextFromParallel: string | undefined = undefined;
+                for (const target of validTargets) {
+                  if (this.def.edges.has(target)) {
+                    nextFromParallel = this.def.edges.get(target);
+                  }
+                }
+                currentNode = nextFromParallel ?? END;
+              }
+            }
+          } else {
+            // 路由返回值必须是已注册节点名或 END 哨兵：undefined（忘写 return）、
+            // 非字符串、未注册名一律视为路由错误，与"未注册节点名抛错"同一语义，
+            // 不能静默当作正常终止（否则路由 bug 会被洗成 graph/end"成功"）。
+            if (typeof next !== "string" || (next !== END && !this.def.nodes.has(next))) {
+              // 只抛错不 emit：错误会被下方 catch 捕获，由它统一补发一次
+              // graph/error——否则非法目标会 double-emit。
+              throw new Error(
+                `条件路由返回了非法目标：${describeRouteTarget(next)}（必须是已注册节点名或 "__END__"）。`,
+              );
+            }
+            currentNode = next;
           }
-          currentNode = next;
         } else if (this.def.edges.has(currentNode)) {
           currentNode = this.def.edges.get(currentNode);
         } else {
