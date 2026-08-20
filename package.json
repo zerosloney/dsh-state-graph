@@ -3,6 +3,10 @@
   "version": "0.1.0",
   "description": "StateGraph orchestration engine as a DeepSeek Harness plugin: declarative directed state graphs with conditional routing, loopback, iteration guards, and a trajectory event stream.",
   "license": "MIT",
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  },
   "type": "module",
   "files": [
     "lib/",
