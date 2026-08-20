@@ -46,17 +46,14 @@ addNode / addEdge / addConditionalEdge → 纯函数增量补丁 → 迭代熔�
 
 ## 安装
 
-作为一个 bundle 包装进某个 profile：
+插件已发布到 npm registry（`dsh-state-graph`，随 `v*` tag 由 CI 自动发布）。在 DeepSeek Harness 中通过 npm 包路径安装——`dsh plugin add` 会安装依赖并自动把包名追加到 profile 的 `dsh.profile.bundles`：
 
 ```sh
-# 发布后
-dsh plugin --profile web add dsh-state-graph
-
-# 本地开发（file: 链接）
-# 在 $DSH_HOME/profiles/<name>/package.json 加依赖并安装
+dsh plugin add --profile web dsh-state-graph
+dsh --profile web --dump-config          # 确认 state-graph 行已组合
 ```
 
-profile 的 `dsh.profile.bundles` 需要包含 `dsh-state-graph`（与 `@deepseek-ai/dsh-base` 一起）。插件无其他注入依赖，任何 profile 均可加载。
+profile 的 `dsh.profile.bundles` 需要包含 `dsh-state-graph`（与 `@deepseek-ai/dsh-base` 一起）。插件无其他注入依赖，任何 profile 均可加载。升级到新版本：`dsh plugin add --profile web dsh-state-graph@latest`。
 
 ## 配置（`cordis.patch.yml` 的 `config`）
 
